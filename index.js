@@ -25,9 +25,7 @@ async function sendToN8N(event, data) {
   if (!N8N_WEBHOOK_URL) return;
   try {
     await axios.post(N8N_WEBHOOK_URL, {
-      event,
-      instance: 'presence-baileys',
-      data,
+      event, instance: 'presence-baileys', data,
       date_time: new Date().toISOString(),
       sender: sock?.user?.id || ''
     }, { timeout: 5000 });
@@ -41,12 +39,8 @@ async function connectToWhatsApp() {
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
-    },
+    version, logger,
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     printQRInTerminal: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
@@ -60,14 +54,10 @@ async function connectToWhatsApp() {
       qrString = qr;
       connectionState = 'qr';
       console.log('[QR] Nuevo QR generado');
-
-      // Convertir a base64 PNG real
       try {
         const base64 = await QRCode.toDataURL(qr);
         await sendToN8N('qrcode.updated', { qrcode: { base64 } });
-      } catch (e) {
-        console.log('[QR] Error convirtiendo QR:', e.message);
-      }
+      } catch (e) {}
     }
 
     if (connection === 'open') {
@@ -75,28 +65,19 @@ async function connectToWhatsApp() {
       connectionState = 'connected';
       console.log('[WA] Conectado:', sock.user?.id);
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
-
-      for (const number of subscribedNumbers) {
-        await subscribeToPresence(number);
-      }
+      for (const number of subscribedNumbers) await subscribeToPresence(number);
     }
 
     if (connection === 'close') {
       connectionState = 'disconnected';
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-        ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut
-        : true;
-
+        ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut : true;
       console.log('[WA] Desconectado. Reconectar:', shouldReconnect);
       await sendToN8N('connection.update', { state: 'close' });
-
       if (shouldReconnect) {
         setTimeout(connectToWhatsApp, 5000);
       } else {
-        connectionState = 'disconnected';
-        if (fs.existsSync(AUTH_DIR)) {
-          fs.rmSync(AUTH_DIR, { recursive: true });
-        }
+        if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true });
       }
     }
   });
@@ -107,11 +88,7 @@ async function connectToWhatsApp() {
     console.log('[PRESENCE]', id, JSON.stringify(presences));
     const contactNumber = id.split('@')[0];
     const presenceInfo = presences[id] || presences[Object.keys(presences)[0]] || {};
-
-    await sendToN8N('presence.update', {
-      id: contactNumber,
-      presences: { [id]: presenceInfo }
-    });
+    await sendToN8N('presence.update', { id: contactNumber, presences: { [id]: presenceInfo } });
   });
 }
 
@@ -135,25 +112,50 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', state: connectionState });
+// Página web con QR que se refresca automáticamente
+app.get('/qr-page', (req, res) => {
+  if (connectionState === 'connected') {
+    return res.send('<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px"><h1>✓ WhatsApp Conectado</h1><p>La sesión está activa. Puedes cerrar esta página.</p></body></html>');
+  }
+  res.send(`<html>
+<head><meta charset="utf-8"><title>Escanear QR</title>
+<meta http-equiv="refresh" content="20">
+<style>body{background:#0B1120;color:#E7EAF2;font-family:sans-serif;text-align:center;padding:40px}
+h1{color:#22D67A}img{border:8px solid white;border-radius:12px;margin:20px}
+p{color:#6B7494}</style></head>
+<body>
+<h1>Monitor de Presencia</h1>
+<p>Escanea este código QR desde WhatsApp → Dispositivos vinculados</p>
+<img id="qr" src="/qr-image" width="280" height="280" alt="QR Code">
+<p>Estado: <strong style="color:#F0A830">${connectionState}</strong></p>
+<p>Esta página se refresca automáticamente cada 20 segundos</p>
+</body></html>`);
 });
 
+// Endpoint que devuelve el QR como imagen PNG directa
+app.get('/qr-image', async (req, res) => {
+  if (!qrString) {
+    return res.status(404).send('No QR disponible');
+  }
+  try {
+    const buffer = await QRCode.toBuffer(qrString, { width: 280, margin: 2 });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(buffer);
+  } catch (e) {
+    res.status(500).send('Error generando QR');
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok', state: connectionState }));
+
 app.get('/status', authMiddleware, (req, res) => {
-  res.json({
-    state: connectionState,
-    number: sock?.user?.id || null,
-    subscribedNumbers: [...subscribedNumbers]
-  });
+  res.json({ state: connectionState, number: sock?.user?.id || null, subscribedNumbers: [...subscribedNumbers] });
 });
 
 app.get('/qr', authMiddleware, async (req, res) => {
-  if (connectionState === 'connected') {
-    return res.json({ state: 'connected', message: 'Ya está conectado' });
-  }
-  if (!qrString) {
-    return res.json({ state: connectionState, message: 'No hay QR disponible aún, espera unos segundos' });
-  }
+  if (connectionState === 'connected') return res.json({ state: 'connected' });
+  if (!qrString) return res.json({ state: connectionState, message: 'No hay QR aún' });
   try {
     const base64 = await QRCode.toDataURL(qrString);
     res.json({ state: 'qr', base64 });
@@ -171,9 +173,7 @@ app.post('/subscribe', authMiddleware, async (req, res) => {
 
 app.post('/subscribe/bulk', authMiddleware, async (req, res) => {
   const { numbers } = req.body;
-  if (!numbers || !Array.isArray(numbers)) {
-    return res.status(400).json({ error: 'numbers (array) requerido' });
-  }
+  if (!numbers || !Array.isArray(numbers)) return res.status(400).json({ error: 'numbers array requerido' });
   const results = [];
   for (const number of numbers) {
     const success = await subscribeToPresence(number);

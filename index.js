@@ -25,6 +25,12 @@ let connectionState = 'disconnected';
 let subscribedNumbers = new Set();
 let resubscribeTimer = null;
 
+// Mapa LID -> numero de telefono. WhatsApp identifica a algunos contactos
+// con un "@lid" (Linked ID) en vez del numero real por privacidad. Lo
+// capturamos aqui en el momento de suscribirnos, cuando SI sabemos con
+// certeza a que numero corresponde.
+let lidToNumberMap = new Map();
+
 const logger = pino({ level: 'silent' });
 
 async function sendToN8N(event, data) {
@@ -108,7 +114,31 @@ async function connectToWhatsApp() {
 
   sock.ev.on('presence.update', async ({ id, presences }) => {
     console.log('[PRESENCE]', id, JSON.stringify(presences));
-    const contactNumber = id.split('@')[0];
+
+    let contactNumber = id.split('@')[0];
+
+    // Si WhatsApp nos dio un @lid en vez del numero real, intentamos
+    // traducirlo usando el mapa que armamos al suscribirnos, y si no,
+    // preguntandole directamente a Baileys.
+    if (id.endsWith('@lid')) {
+      if (lidToNumberMap.has(id)) {
+        contactNumber = lidToNumberMap.get(id);
+      } else if (sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await sock.signalRepository.lidMapping.getPNForLID(id);
+          if (pn) {
+            contactNumber = pn.split('@')[0];
+            lidToNumberMap.set(id, contactNumber);
+            console.log('[LID] Resuelto por signalRepository:', id, '->', contactNumber);
+          } else {
+            console.log('[LID] No se pudo resolver (getPNForLID devolvio vacio):', id);
+          }
+        } catch (e) {
+          console.log('[LID] Error resolviendo:', e.message);
+        }
+      }
+    }
+
     const presenceInfo = presences[id] || presences[Object.keys(presences)[0]] || {};
     await sendToN8N('presence.update', { id: contactNumber, presences: { [id]: presenceInfo } });
   });
@@ -118,6 +148,20 @@ async function subscribeToPresence(number) {
   if (!sock || connectionState !== 'connected') return false;
   try {
     const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
+
+    // Intentamos obtener el LID asociado a este numero ANTES de suscribirnos,
+    // porque en este momento sabemos con certeza el numero real detras de el.
+    try {
+      const results = await sock.onWhatsApp(jid);
+      const info = results?.[0];
+      if (info?.lid) {
+        lidToNumberMap.set(info.lid, number);
+        console.log(`[LID] Mapeado ${info.lid} -> ${number}`);
+      }
+    } catch (e) {
+      console.log('[LID] No se pudo obtener lid para', number, ':', e.message);
+    }
+
     await sock.presenceSubscribe(jid);
     subscribedNumbers.add(number);
     console.log('[SUBSCRIBE] Suscrito a:', jid);
@@ -133,7 +177,15 @@ async function subscribeToPresence(number) {
 function startResubscribeLoop() {
   if (resubscribeTimer) return; // ya esta corriendo
   resubscribeTimer = setInterval(async () => {
-    if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
+    if (connectionState !== 'connected') return;
+
+    // Refrescamos tambien nuestro propio estado "no disponible", por si
+    // WhatsApp lo resetea solo despues de un rato.
+    try {
+      await sock.sendPresenceUpdate('unavailable');
+    } catch (e) {}
+
+    if (subscribedNumbers.size === 0) return;
     console.log(`[RESUBSCRIBE] Refrescando ${subscribedNumbers.size} suscripciones...`);
     for (const number of subscribedNumbers) {
       await subscribeToPresence(number);

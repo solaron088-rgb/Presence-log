@@ -3,29 +3,26 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const axios = require('axios');
 const pino = require('pino');
+const QRCode = require('qrcode');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(express.json());
 
-// ── Config ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || 'https://evolutionapi-monitor-n8n.zelwnc.easypanel.host/webhook/evolution-events';
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info';
 const API_KEY = process.env.API_KEY || 'presence-baileys-key';
 
-// ── Estado global ────────────────────────────────────────
 let sock = null;
-let qrCode = null;
-let connectionState = 'disconnected'; // disconnected | qr | connected
+let qrString = null;
+let connectionState = 'disconnected';
 let subscribedNumbers = new Set();
 
-// ── Logger silencioso ────────────────────────────────────
 const logger = pino({ level: 'silent' });
 
-// ── Enviar evento a N8N ──────────────────────────────────
 async function sendToN8N(event, data) {
+  if (!N8N_WEBHOOK_URL) return;
   try {
     await axios.post(N8N_WEBHOOK_URL, {
       event,
@@ -39,7 +36,6 @@ async function sendToN8N(event, data) {
   }
 }
 
-// ── Conectar a WhatsApp ──────────────────────────────────
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -52,29 +48,34 @@ async function connectToWhatsApp() {
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
     printQRInTerminal: false,
-    markOnlineOnConnect: false, // No aparecer en línea al conectar
+    markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
   });
 
-  // ── QR Code ──────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      qrCode = qr;
+      qrString = qr;
       connectionState = 'qr';
       console.log('[QR] Nuevo QR generado');
-      await sendToN8N('qrcode.updated', { qrcode: { base64: `data:image/png;base64,${Buffer.from(qr).toString('base64')}` } });
+
+      // Convertir a base64 PNG real
+      try {
+        const base64 = await QRCode.toDataURL(qr);
+        await sendToN8N('qrcode.updated', { qrcode: { base64 } });
+      } catch (e) {
+        console.log('[QR] Error convirtiendo QR:', e.message);
+      }
     }
 
     if (connection === 'open') {
-      qrCode = null;
+      qrString = null;
       connectionState = 'connected';
       console.log('[WA] Conectado:', sock.user?.id);
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
 
-      // Re-suscribir a todos los números guardados
       for (const number of subscribedNumbers) {
         await subscribeToPresence(number);
       }
@@ -93,7 +94,6 @@ async function connectToWhatsApp() {
         setTimeout(connectToWhatsApp, 5000);
       } else {
         connectionState = 'disconnected';
-        // Limpiar auth si fue logout
         if (fs.existsSync(AUTH_DIR)) {
           fs.rmSync(AUTH_DIR, { recursive: true });
         }
@@ -103,31 +103,25 @@ async function connectToWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ── PRESENCE UPDATE — el evento clave ────────────────
   sock.ev.on('presence.update', async ({ id, presences }) => {
     console.log('[PRESENCE]', id, JSON.stringify(presences));
-
     const contactNumber = id.split('@')[0];
     const presenceInfo = presences[id] || presences[Object.keys(presences)[0]] || {};
-    const lastKnownPresence = presenceInfo.lastKnownPresence || 'unavailable';
 
     await sendToN8N('presence.update', {
       id: contactNumber,
-      presences: {
-        [id]: presenceInfo
-      }
+      presences: { [id]: presenceInfo }
     });
   });
 }
 
-// ── Suscribirse a presencia de un número ─────────────────
 async function subscribeToPresence(number) {
   if (!sock || connectionState !== 'connected') return false;
   try {
     const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
     await sock.presenceSubscribe(jid);
     subscribedNumbers.add(number);
-    console.log('[SUBSCRIBE] Suscrito a presencia de:', jid);
+    console.log('[SUBSCRIBE] Suscrito a:', jid);
     return true;
   } catch (err) {
     console.log('[SUBSCRIBE] Error:', err.message);
@@ -135,18 +129,16 @@ async function subscribeToPresence(number) {
   }
 }
 
-// ════════════════════════════════════════════════════════
-// API REST
-// ════════════════════════════════════════════════════════
-
-// Middleware de auth
 function authMiddleware(req, res, next) {
   const key = req.headers['apikey'] || req.headers['x-api-key'];
   if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// GET /status — estado de conexión
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', state: connectionState });
+});
+
 app.get('/status', authMiddleware, (req, res) => {
   res.json({
     state: connectionState,
@@ -155,45 +147,42 @@ app.get('/status', authMiddleware, (req, res) => {
   });
 });
 
-// GET /qr — obtener QR actual
-app.get('/qr', authMiddleware, (req, res) => {
+app.get('/qr', authMiddleware, async (req, res) => {
   if (connectionState === 'connected') {
     return res.json({ state: 'connected', message: 'Ya está conectado' });
   }
-  if (!qrCode) {
-    return res.json({ state: connectionState, message: 'No hay QR disponible aún' });
+  if (!qrString) {
+    return res.json({ state: connectionState, message: 'No hay QR disponible aún, espera unos segundos' });
   }
-  const base64 = `data:image/png;base64,${Buffer.from(qrCode).toString('base64')}`;
-  res.json({ state: 'qr', base64 });
+  try {
+    const base64 = await QRCode.toDataURL(qrString);
+    res.json({ state: 'qr', base64 });
+  } catch (e) {
+    res.status(500).json({ error: 'Error generando QR' });
+  }
 });
 
-// POST /subscribe — suscribirse a presencia de un número
 app.post('/subscribe', authMiddleware, async (req, res) => {
   const { number } = req.body;
   if (!number) return res.status(400).json({ error: 'number requerido' });
-
   const success = await subscribeToPresence(number);
   res.json({ success, number, state: connectionState });
 });
 
-// POST /subscribe/bulk — suscribirse a múltiples números
 app.post('/subscribe/bulk', authMiddleware, async (req, res) => {
   const { numbers } = req.body;
   if (!numbers || !Array.isArray(numbers)) {
     return res.status(400).json({ error: 'numbers (array) requerido' });
   }
-
   const results = [];
   for (const number of numbers) {
     const success = await subscribeToPresence(number);
     results.push({ number, success });
-    await new Promise(r => setTimeout(r, 500)); // Delay entre suscripciones
+    await new Promise(r => setTimeout(r, 500));
   }
-
   res.json({ results });
 });
 
-// POST /disconnect — cerrar sesión
 app.post('/disconnect', authMiddleware, async (req, res) => {
   try {
     await sock?.logout();
@@ -205,12 +194,6 @@ app.post('/disconnect', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /health — health check sin auth
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', state: connectionState });
-});
-
-// ── Iniciar ──────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[SERVER] Escuchando en puerto ${PORT}`);
   connectToWhatsApp();

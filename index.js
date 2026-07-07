@@ -14,10 +14,16 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info';
 const API_KEY = process.env.API_KEY || 'presence-baileys-key';
 
+// Cada cuanto se refresca la suscripcion de presencia (en minutos).
+// La suscripcion de WhatsApp expira sola despues de unos minutos, por eso
+// hay que renovarla periodicamente para los numeros que queremos monitorear.
+const RESUBSCRIBE_INTERVAL_MINUTES = 4;
+
 let sock = null;
 let qrString = null;
 let connectionState = 'disconnected';
 let subscribedNumbers = new Set();
+let resubscribeTimer = null;
 
 const logger = pino({ level: 'silent' });
 
@@ -65,11 +71,27 @@ async function connectToWhatsApp() {
       connectionState = 'connected';
       console.log('[WA] Conectado:', sock.user?.id);
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
+
+      // Nos marcamos como "no disponible" apenas conectamos, para no
+      // aparecer en linea ante nuestros contactos solo por tener el
+      // servicio corriendo en el servidor.
+      try {
+        await sock.sendPresenceUpdate('unavailable');
+        console.log('[PRESENCE] Marcado como unavailable al conectar');
+      } catch (e) {
+        console.log('[PRESENCE] Error marcando unavailable:', e.message);
+      }
+
+      // (Re)suscribimos a todos los numeros conocidos al reconectar
       for (const number of subscribedNumbers) await subscribeToPresence(number);
+
+      // Arrancamos el refresco periodico de suscripcion (si no estaba ya corriendo)
+      startResubscribeLoop();
     }
 
     if (connection === 'close') {
       connectionState = 'disconnected';
+      stopResubscribeLoop();
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut : true;
       console.log('[WA] Desconectado. Reconectar:', shouldReconnect);
@@ -106,16 +128,37 @@ async function subscribeToPresence(number) {
   }
 }
 
+// Vuelve a suscribirse a todos los numeros conocidos cada X minutos,
+// porque la suscripcion de presencia en WhatsApp expira sola.
+function startResubscribeLoop() {
+  if (resubscribeTimer) return; // ya esta corriendo
+  resubscribeTimer = setInterval(async () => {
+    if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
+    console.log(`[RESUBSCRIBE] Refrescando ${subscribedNumbers.size} suscripciones...`);
+    for (const number of subscribedNumbers) {
+      await subscribeToPresence(number);
+      await new Promise(r => setTimeout(r, 400));
+    }
+  }, RESUBSCRIBE_INTERVAL_MINUTES * 60 * 1000);
+}
+
+function stopResubscribeLoop() {
+  if (resubscribeTimer) {
+    clearInterval(resubscribeTimer);
+    resubscribeTimer = null;
+  }
+}
+
 function authMiddleware(req, res, next) {
   const key = req.headers['apikey'] || req.headers['x-api-key'];
   if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// Página web con QR que se refresca automáticamente
+// Pagina web con QR que se refresca automaticamente
 app.get('/qr-page', (req, res) => {
   if (connectionState === 'connected') {
-    return res.send('<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px"><h1>✓ WhatsApp Conectado</h1><p>La sesión está activa. Puedes cerrar esta página.</p></body></html>');
+    return res.send('<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px"><h1>&#10003; WhatsApp Conectado</h1><p>La sesion esta activa. Puedes cerrar esta pagina.</p></body></html>');
   }
   res.send(`<html>
 <head><meta charset="utf-8"><title>Escanear QR</title>
@@ -125,10 +168,10 @@ h1{color:#22D67A}img{border:8px solid white;border-radius:12px;margin:20px}
 p{color:#6B7494}</style></head>
 <body>
 <h1>Monitor de Presencia</h1>
-<p>Escanea este código QR desde WhatsApp → Dispositivos vinculados</p>
+<p>Escanea este codigo QR desde WhatsApp &rarr; Dispositivos vinculados</p>
 <img id="qr" src="/qr-image" width="280" height="280" alt="QR Code">
 <p>Estado: <strong style="color:#F0A830">${connectionState}</strong></p>
-<p>Esta página se refresca automáticamente cada 20 segundos</p>
+<p>Esta pagina se refresca automaticamente cada 20 segundos</p>
 </body></html>`);
 });
 
@@ -155,7 +198,7 @@ app.get('/status', authMiddleware, (req, res) => {
 
 app.get('/qr', authMiddleware, async (req, res) => {
   if (connectionState === 'connected') return res.json({ state: 'connected' });
-  if (!qrString) return res.json({ state: connectionState, message: 'No hay QR aún' });
+  if (!qrString) return res.json({ state: connectionState, message: 'No hay QR aun' });
   try {
     const base64 = await QRCode.toDataURL(qrString);
     res.json({ state: 'qr', base64 });
@@ -183,11 +226,22 @@ app.post('/subscribe/bulk', authMiddleware, async (req, res) => {
   res.json({ results });
 });
 
+// Marca tu propia cuenta como "no disponible" manualmente, por si acaso.
+app.post('/set-unavailable', authMiddleware, async (req, res) => {
+  try {
+    await sock?.sendPresenceUpdate('unavailable');
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 app.post('/disconnect', authMiddleware, async (req, res) => {
   try {
     await sock?.logout();
     connectionState = 'disconnected';
     subscribedNumbers.clear();
+    stopResubscribeLoop();
     res.json({ success: true });
   } catch (err) {
     res.json({ success: false, error: err.message });

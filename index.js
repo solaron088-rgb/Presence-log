@@ -14,10 +14,12 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info';
 const API_KEY = process.env.API_KEY || 'presence-baileys-key';
 
-// Cada cuanto se refresca la suscripcion de presencia (en minutos).
-// La suscripcion de WhatsApp expira sola despues de unos minutos, por eso
-// hay que renovarla periodicamente para los numeros que queremos monitorear.
-const RESUBSCRIBE_INTERVAL_MINUTES = 4;
+// Cada cuanto se refresca la suscripcion de presencia (en SEGUNDOS).
+// La ventana real de suscripcion de WhatsApp parece durar solo segundos,
+// no minutos, por eso hay que renovarla muy seguido para detectar cambios
+// de estado en tiempo real. Empezamos agresivo (20s) para confirmar que
+// funciona; si genera demasiado trafico se puede subir despues.
+const RESUBSCRIBE_INTERVAL_SECONDS = 20;
 
 let sock = null;
 let qrString = null;
@@ -199,7 +201,7 @@ function startResubscribeLoop() {
       await subscribeToPresence(number);
       await new Promise(r => setTimeout(r, 400));
     }
-  }, RESUBSCRIBE_INTERVAL_MINUTES * 60 * 1000);
+  }, RESUBSCRIBE_INTERVAL_SECONDS * 1000);
 }
 
 function stopResubscribeLoop() {

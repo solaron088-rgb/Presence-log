@@ -123,18 +123,23 @@ async function connectToWhatsApp() {
     if (id.endsWith('@lid')) {
       if (lidToNumberMap.has(id)) {
         contactNumber = lidToNumberMap.get(id);
-      } else if (sock.signalRepository?.lidMapping?.getPNForLID) {
-        try {
-          const pn = await sock.signalRepository.lidMapping.getPNForLID(id);
-          if (pn) {
-            contactNumber = pn.split('@')[0];
-            lidToNumberMap.set(id, contactNumber);
-            console.log('[LID] Resuelto por signalRepository:', id, '->', contactNumber);
-          } else {
-            console.log('[LID] No se pudo resolver (getPNForLID devolvio vacio):', id);
+        console.log('[LID] Resuelto desde mapa local:', id, '->', contactNumber);
+      } else {
+        console.log('[LID] no esta en el mapa local. signalRepository disponible:', !!sock.signalRepository, '| lidMapping disponible:', !!sock.signalRepository?.lidMapping, '| getPNForLID disponible:', typeof sock.signalRepository?.lidMapping?.getPNForLID);
+        if (sock.signalRepository?.lidMapping?.getPNForLID) {
+          try {
+            const pn = await sock.signalRepository.lidMapping.getPNForLID(id);
+            console.log('[DEBUG getPNForLID]', id, '->', pn);
+            if (pn) {
+              contactNumber = pn.split('@')[0];
+              lidToNumberMap.set(id, contactNumber);
+              console.log('[LID] Resuelto por signalRepository:', id, '->', contactNumber);
+            } else {
+              console.log('[LID] No se pudo resolver (getPNForLID devolvio vacio):', id);
+            }
+          } catch (e) {
+            console.log('[LID] Error resolviendo:', e.message);
           }
-        } catch (e) {
-          console.log('[LID] Error resolviendo:', e.message);
         }
       }
     }
@@ -153,10 +158,13 @@ async function subscribeToPresence(number) {
     // porque en este momento sabemos con certeza el numero real detras de el.
     try {
       const results = await sock.onWhatsApp(jid);
+      console.log('[DEBUG onWhatsApp]', number, '->', JSON.stringify(results));
       const info = results?.[0];
       if (info?.lid) {
         lidToNumberMap.set(info.lid, number);
         console.log(`[LID] Mapeado ${info.lid} -> ${number}`);
+      } else {
+        console.log(`[LID] onWhatsApp no devolvio campo lid para ${number}`);
       }
     } catch (e) {
       console.log('[LID] No se pudo obtener lid para', number, ':', e.message);

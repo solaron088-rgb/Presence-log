@@ -14,10 +14,9 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info';
 const API_KEY = process.env.API_KEY || 'presence-baileys-key';
 
-// Intervalos sigilosos
-const HEARTBEAT_INTERVAL_MS = 15000;  // Latido cada 15s (mantiene el socket vivo)
-const PROBE_INTERVAL_MS = 30000;      // Consulta sigilosa cada 30s
-const RESUB_INTERVAL_MS = 45000;      // Re-suscripción cada 45s
+const HEARTBEAT_INTERVAL_MS = 15000;
+const PROBE_INTERVAL_MS = 30000;
+const RESUB_INTERVAL_MS = 45000;
 
 let sock = null;
 let qrString = null;
@@ -25,47 +24,51 @@ let connectionState = 'disconnected';
 let subscribedNumbers = new Set();
 let lastPresenceState = new Map();
 
-// Timers
 let heartbeatTimer = null;
 let probeTimer = null;
 let resubTimer = null;
 
-// Mapeos LID (La clave real del éxito)
 let numberToLidMap = new Map();
 let lidToNumberMap = new Map();
 
 const logger = pino({ level: 'silent' });
 
 // ============================================
-// ENVIAR A N8N
+// ENVIAR A N8N (CON LOGS)
 // ============================================
 async function sendToN8N(event, data) {
-  if (!N8N_WEBHOOK_URL) return;
+  if (!N8N_WEBHOOK_URL) {
+    console.log('[N8N] ⚠️ SIN URL CONFIGURADA');
+    return false;
+  }
   try {
-    await axios.post(N8N_WEBHOOK_URL, {
-      event, instance: 'presence-stealth', data,
+    console.log(`[N8N] Enviando: ${event}`);
+    console.log(`[N8N] URL: ${N8N_WEBHOOK_URL}`);
+    const response = await axios.post(N8N_WEBHOOK_URL, {
+      event, 
+      instance: 'presence-stealth', 
+      data,
       date_time: new Date().toISOString(),
       sender: sock?.user?.id || ''
     }, { timeout: 5000 });
+    console.log(`[N8N] ✓ EXITO - Status: ${response.status}`);
+    return true;
   } catch (err) {
-    console.log(`[N8N] Error:`, err.message);
+    console.log(`[N8N] ✗ ERROR: ${err.message}`);
+    if (err.response) {
+      console.log(`[N8N] ✗ Status: ${err.response.status}`);
+    }
+    return false;
   }
 }
 
 // ============================================
-// TÉCNICA 1: STEALTH HEARTBEAT (Latido Sigiloso)
-// ============================================
-// Consultar tu propia foto de perfil genera tráfico WebSocket
-// necesario para que WhatsApp no considere la conexión "muerta",
-// pero NO te muestra online ni envía nada a nadie.
+// STEALTH HEARTBEAT
 // ============================================
 async function stealthHeartbeat() {
   if (!sock || connectionState !== 'connected') return;
   try {
-    // Asegurar que seguimos invisibles
     await sock.sendPresenceUpdate('unavailable');
-    
-    // Consultar nuestra propia foto de perfil (genera tráfico interno)
     if (sock.profilePictureUrl) {
       await sock.profilePictureUrl(sock.user.id, 'preview').catch(() => {});
     }
@@ -73,12 +76,7 @@ async function stealthHeartbeat() {
 }
 
 // ============================================
-// TÉCNICA 2: STEALTH PROBE (Sonda de Estado)
-// ============================================
-// En lugar de enviar un mensaje, consultamos el ESTADO (Status/Texto)
-// del contacto. Esto obliga a WhatsApp a consultar su perfil,
-// lo que a menudo dispara un evento de presencia en nuestro socket.
-// ES 100% INVISIBLE. No genera notificación ni "escribiendo...".
+// STEALTH PROBE
 // ============================================
 async function stealthProbe(number) {
   if (!sock || connectionState !== 'connected') return;
@@ -88,49 +86,52 @@ async function stealthProbe(number) {
   const lidJid = numberToLidMap.get(cleanNumber);
 
   try {
-    // Consultar el texto de estado (bio) del número
     await sock.fetchStatus(jid).catch(() => {});
-    
-    // Si tiene LID, también consultamos el LID
     if (lidJid) {
       await sock.fetchStatus(lidJid).catch(() => {});
     }
-    
-    // También consultamos la foto de perfil (otro read-only que despierta el canal)
     if (sock.profilePictureUrl) {
       await sock.profilePictureUrl(jid, 'preview').catch(() => {});
       if (lidJid) {
         await sock.profilePictureUrl(lidJid, 'preview').catch(() => {});
       }
     }
-  } catch (e) {
-    // Ignorar errores, es normal si tienen privacidad estricta
-  }
+  } catch (e) {}
 }
 
 // ============================================
-// RESOLVER JID A NÚMERO
+// RESOLVER JID A NÚMERO (MEJORADO)
 // ============================================
 function resolveJidToNumber(jid) {
   if (!jid) return 'unknown';
-  if (jid.endsWith('@s.whatsapp.net')) return jid.split('@')[0];
   
-  if (jid.endsWith('@lid')) {
-    // Búsqueda exacta
-    if (lidToNumberMap.has(jid)) return lidToNumberMap.get(jid);
-    
-    // Búsqueda parcial (a veces el JID viene con prefijos extra)
-    const lidPart = jid.replace('@lid', '');
-    for (const [lid, num] of lidToNumberMap.entries()) {
-      if (lid.includes(lidPart)) return num;
-    }
-    return jid; // Si no encuentra, devuelve el LID
+  // Caso 1: JID normal
+  if (jid.endsWith('@s.whatsapp.net')) {
+    return jid.split('@')[0];
   }
+  
+  // Caso 2: LID (con variaciones)
+  if (jid.includes('@lid') || jid.includes('@1id')) {
+    const lidClean = jid.split('@')[0];
+    
+    // Búsqueda exacta
+    for (const [lid, num] of lidToNumberMap.entries()) {
+      const lidPart = lid.split('@')[0];
+      if (lidPart === lidClean || lid.includes(lidClean) || lidClean.includes(lidPart)) {
+        return num;
+      }
+    }
+    
+    console.log(`[MAP] ⚠️ LID sin mapear: ${jid}`);
+    console.log(`[MAP] LIDs conocidos:`, [...lidToNumberMap.keys()]);
+    return lidClean; // Devuelve el LID si no encuentra
+  }
+  
   return jid.split('@')[0];
 }
 
 // ============================================
-// SUSCRIBIRSE (NÚMERO + LID)
+// SUSCRIBIRSE (MEJORADO)
 // ============================================
 async function subscribeToPresence(number) {
   if (!sock || connectionState !== 'connected') return false;
@@ -139,39 +140,43 @@ async function subscribeToPresence(number) {
     const cleanNumber = String(number).replace(/[^0-9]/g, '');
     const jid = `${cleanNumber}@s.whatsapp.net`;
     
-    // 1. Pedir info del número (aquí obtenemos el LID)
     const [info] = await sock.onWhatsApp(jid);
-    if (!info?.exists) return false;
+    if (!info?.exists) {
+      console.log(`[SUB] ✗ No existe: ${cleanNumber}`);
+      return false;
+    }
     
     let lidJid = null;
     if (info?.lid) {
       lidJid = info.lid;
       numberToLidMap.set(cleanNumber, lidJid);
       lidToNumberMap.set(lidJid, cleanNumber);
-      console.log(`[MAP] LID Detectado: ${cleanNumber} ↔ ${lidJid}`);
+      console.log(`[MAP] ✓ ${cleanNumber} ↔ ${lidJid}`);
+    } else {
+      console.log(`[MAP] ⚠️ Sin LID para: ${cleanNumber}`);
     }
     
-    // 2. Suscribirse al NÚMERO
     await sock.presenceSubscribe(jid);
+    console.log(`[SUB] ✓ Suscrito número: ${cleanNumber}`);
     
-    // 3. Suscribirse al LID (OBLIGATORIO: WhatsApp usa el LID para enviar el evento)
     if (lidJid) {
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 300));
       await sock.presenceSubscribe(lidJid);
+      console.log(`[SUB] ✓ Suscrito LID: ${lidJid}`);
     }
     
     subscribedNumbers.add(cleanNumber);
-    console.log(`[SUB] Vigilando a: ${cleanNumber}`);
+    console.log(`[SUB] 👁 Vigilando a: ${cleanNumber}`);
     return true;
     
   } catch (err) {
-    console.log('[SUB] Error:', err.message);
+    console.log(`[SUB] ✗ Error: ${err.message}`);
     return false;
   }
 }
 
 // ============================================
-// PROCESAR EVENTO DE PRESENCIA
+// PROCESAR EVENTO (MEJORADO)
 // ============================================
 async function processPresenceEvent(id, presences) {
   if (!id || !presences) return;
@@ -193,7 +198,6 @@ async function processPresenceEvent(id, presences) {
   
   const prevState = lastPresenceState.get(contactNumber);
   
-  // Filtrar duplicados exactos
   if (prevState === newState && !lastSeen) return;
   
   lastPresenceState.set(contactNumber, newState);
@@ -202,11 +206,15 @@ async function processPresenceEvent(id, presences) {
                     newState === 'unavailable' ? '🔴 DESCONECTADO' : 
                     `⚪ ${newState}`;
   
-  console.log(`\n[!] EVENTO DETECTADO: ${contactNumber}`);
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`[!] EVENTO DETECTADO: ${contactNumber}`);
   console.log(`    Estado: ${stateText}`);
   console.log(`    Anterior: ${prevState || 'Desconocido'}`);
+  console.log(`    JID original: ${id}`);
   if (lastSeen) console.log(`    Últ. vez: ${new Date(lastSeen * 1000).toLocaleString()}`);
+  console.log(`${'='.repeat(50)}`);
   
+  // ENVIAR A N8N
   await sendToN8N('presence.update', {
     id: contactNumber,
     originalJid: id,
@@ -219,39 +227,32 @@ async function processPresenceEvent(id, presences) {
 }
 
 // ============================================
-// LOOPS DE FONDO
+// LOOPS
 // ============================================
 function startLoops() {
   if (heartbeatTimer) return;
   
   console.log('[LOOPS] Iniciando sistema sigiloso...');
   
-  // Loop 1: Latido (Mantener socket vivo sin aparecer online)
   heartbeatTimer = setInterval(stealthHeartbeat, HEARTBEAT_INTERVAL_MS);
   
-  // Loop 2: Sonda (Consultar status/foto para forzar detección)
   probeTimer = setInterval(async () => {
     if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
-    
     for (const number of subscribedNumbers) {
       await stealthProbe(number);
-      await new Promise(r => setTimeout(r, 300)); // Pausa para no hacer spam
+      await new Promise(r => setTimeout(r, 300));
     }
   }, PROBE_INTERVAL_MS);
   
-  // Loop 3: Re-suscripción (Renovar la petición de presencia)
   resubTimer = setInterval(async () => {
     if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
-    
     for (const number of subscribedNumbers) {
       const jid = `${number}@s.whatsapp.net`;
       const lidJid = numberToLidMap.get(number);
-      
       try {
         await sock.presenceSubscribe(jid);
         if (lidJid) await sock.presenceSubscribe(lidJid);
       } catch (e) {}
-      
       await new Promise(r => setTimeout(r, 200));
     }
   }, RESUB_INTERVAL_MS);
@@ -264,7 +265,7 @@ function stopLoops() {
 }
 
 // ============================================
-// CONEXIÓN A WHATSAPP
+// CONEXIÓN
 // ============================================
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -274,7 +275,7 @@ async function connectToWhatsApp() {
     version, logger,
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     printQRInTerminal: false,
-    markOnlineOnConnect: false, // CLAVE: No aparecer online
+    markOnlineOnConnect: false,
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
   });
@@ -295,22 +296,24 @@ async function connectToWhatsApp() {
       qrString = null;
       connectionState = 'connected';
       console.log('\n========================================');
-      console.log(`  ✓ MODO SIGILOSO ACTIVADO`);
+      console.log('  ✓ MODO SIGILOSO ACTIVADO');
       console.log(`  Sesión: ${sock.user?.id}`);
       console.log('========================================\n');
+      
+      // Log de configuración
+      console.log(`[CONFIG] N8N URL: ${N8N_WEBHOOK_URL || 'NO CONFIGURADA'}`);
+      console.log(`[CONFIG] API KEY: ${API_KEY}`);
       
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
 
       await new Promise(r => setTimeout(r, 1000));
       await sock.sendPresenceUpdate('unavailable');
       
-      // Re-suscribir a conocidos
       for (const number of subscribedNumbers) {
         await subscribeToPresence(number);
         await new Promise(r => setTimeout(r, 300));
       }
       
-      // Iniciar loops invisibles
       startLoops();
     }
 
@@ -327,12 +330,8 @@ async function connectToWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ============================================
-  // CAPTURA DE PRESENCIA
-  // ============================================
   sock.ev.on('presence.update', async (eventData) => {
-    // Log crudo para que veas qué llega exactamente
-    console.log('[RAW-DATA]', JSON.stringify(eventData));
+    console.log('[RAW]', JSON.stringify(eventData));
     
     if (eventData?.id && eventData?.presences) {
       await processPresenceEvent(eventData.id, eventData.presences);
@@ -362,7 +361,7 @@ app.get('/qr-page', (req, res) => {
     return res.send(`<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px">
       <h1>✓ Sigiloso Activado</h1><p>Número: ${sock?.user?.id}</p>
       <p>Vigilando: ${subscribedNumbers.size} contactos</p>
-      <p style="color:#666;font-size:12px">No apareces en línea. No dejas rastro.</p>
+      <p style="color:#666;font-size:12px">No apareces en línea.</p>
     </body></html>`);
   }
   res.send(`<html><head><meta charset="utf-8"><title>QR</title>
@@ -415,5 +414,6 @@ app.post('/disconnect', authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[SERVER] Modo Sigiloso en puerto ${PORT}`);
+  console.log(`[SERVER] N8N URL: ${N8N_WEBHOOK_URL || 'NO CONFIGURADA'}`);
   connectToWhatsApp();
 });

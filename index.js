@@ -34,7 +34,7 @@ let lidToNumberMap = new Map();
 const logger = pino({ level: 'silent' });
 
 // ============================================
-// ENVIAR A N8N (CON LOGS)
+// ENVIAR A N8N
 // ============================================
 async function sendToN8N(event, data) {
   if (!N8N_WEBHOOK_URL) {
@@ -43,7 +43,6 @@ async function sendToN8N(event, data) {
   }
   try {
     console.log(`[N8N] Enviando: ${event}`);
-    console.log(`[N8N] URL: ${N8N_WEBHOOK_URL}`);
     const response = await axios.post(N8N_WEBHOOK_URL, {
       event, 
       instance: 'presence-stealth', 
@@ -55,9 +54,7 @@ async function sendToN8N(event, data) {
     return true;
   } catch (err) {
     console.log(`[N8N] ✗ ERROR: ${err.message}`);
-    if (err.response) {
-      console.log(`[N8N] ✗ Status: ${err.response.status}`);
-    }
+    if (err.response) console.log(`[N8N] ✗ Status: ${err.response.status}`);
     return false;
   }
 }
@@ -80,58 +77,43 @@ async function stealthHeartbeat() {
 // ============================================
 async function stealthProbe(number) {
   if (!sock || connectionState !== 'connected') return;
-  
   const cleanNumber = String(number).replace(/[^0-9]/g, '');
   const jid = `${cleanNumber}@s.whatsapp.net`;
   const lidJid = numberToLidMap.get(cleanNumber);
 
   try {
     await sock.fetchStatus(jid).catch(() => {});
-    if (lidJid) {
-      await sock.fetchStatus(lidJid).catch(() => {});
-    }
+    if (lidJid) await sock.fetchStatus(lidJid).catch(() => {});
     if (sock.profilePictureUrl) {
       await sock.profilePictureUrl(jid, 'preview').catch(() => {});
-      if (lidJid) {
-        await sock.profilePictureUrl(lidJid, 'preview').catch(() => {});
-      }
+      if (lidJid) await sock.profilePictureUrl(lidJid, 'preview').catch(() => {});
     }
   } catch (e) {}
 }
 
 // ============================================
-// RESOLVER JID A NÚMERO (MEJORADO)
+// RESOLVER JID A NÚMERO
 // ============================================
 function resolveJidToNumber(jid) {
   if (!jid) return 'unknown';
+  if (jid.endsWith('@s.whatsapp.net')) return jid.split('@')[0];
   
-  // Caso 1: JID normal
-  if (jid.endsWith('@s.whatsapp.net')) {
-    return jid.split('@')[0];
-  }
-  
-  // Caso 2: LID (con variaciones)
   if (jid.includes('@lid') || jid.includes('@1id')) {
     const lidClean = jid.split('@')[0];
-    
-    // Búsqueda exacta
     for (const [lid, num] of lidToNumberMap.entries()) {
       const lidPart = lid.split('@')[0];
       if (lidPart === lidClean || lid.includes(lidClean) || lidClean.includes(lidPart)) {
         return num;
       }
     }
-    
     console.log(`[MAP] ⚠️ LID sin mapear: ${jid}`);
-    console.log(`[MAP] LIDs conocidos:`, [...lidToNumberMap.keys()]);
-    return lidClean; // Devuelve el LID si no encuentra
+    return lidClean;
   }
-  
   return jid.split('@')[0];
 }
 
 // ============================================
-// SUSCRIBIRSE (MEJORADO)
+// SUSCRIBIRSE (CON LOG ESPÍA Y LID FORZADO)
 // ============================================
 async function subscribeToPresence(number) {
   if (!sock || connectionState !== 'connected') return false;
@@ -141,19 +123,40 @@ async function subscribeToPresence(number) {
     const jid = `${cleanNumber}@s.whatsapp.net`;
     
     const [info] = await sock.onWhatsApp(jid);
+    
+    // === LOG ESPÍA ===
+    console.log(`[ESPÍA] WhatsApp respondió de ${cleanNumber}:`, JSON.stringify(info));
+    // ==================
+    
     if (!info?.exists) {
       console.log(`[SUB] ✗ No existe: ${cleanNumber}`);
       return false;
     }
     
     let lidJid = null;
+    
     if (info?.lid) {
       lidJid = info.lid;
       numberToLidMap.set(cleanNumber, lidJid);
       lidToNumberMap.set(lidJid, cleanNumber);
       console.log(`[MAP] ✓ ${cleanNumber} ↔ ${lidJid}`);
     } else {
-      console.log(`[MAP] ⚠️ Sin LID para: ${cleanNumber}`);
+      console.log(`[MAP] ⚠️ Sin LID para: ${cleanNumber}. Forzando...`);
+      try {
+        await sock.profilePictureUrl(jid, 'preview').catch(() => {});
+        await new Promise(r => setTimeout(r, 1000));
+        const [info2] = await sock.onWhatsApp(jid);
+        if (info2?.lid) {
+          lidJid = info2.lid;
+          numberToLidMap.set(cleanNumber, lidJid);
+          lidToNumberMap.set(lidJid, cleanNumber);
+          console.log(`[MAP] ✓ LID forzado: ${cleanNumber} ↔ ${lidJid}`);
+        } else {
+          console.log(`[MAP] ✗ No se pudo obtener LID para: ${cleanNumber}`);
+        }
+      } catch (e) {
+        console.log(`[MAP] ✗ Error forzando LID: ${e.message}`);
+      }
     }
     
     await sock.presenceSubscribe(jid);
@@ -176,35 +179,27 @@ async function subscribeToPresence(number) {
 }
 
 // ============================================
-// PROCESAR EVENTO (MEJORADO)
+// PROCESAR EVENTO
 // ============================================
 async function processPresenceEvent(id, presences) {
   if (!id || !presences) return;
-  
   let presenceInfo = presences[id];
   if (!presenceInfo) {
     const keys = Object.keys(presences);
-    if (keys.length > 0) {
-      id = keys[0];
-      presenceInfo = presences[id];
-    }
+    if (keys.length > 0) { id = keys[0]; presenceInfo = presences[id]; }
   }
-  
   if (!presenceInfo) return;
   
   const contactNumber = resolveJidToNumber(id);
   const newState = presenceInfo.lastKnownPresence || presenceInfo.type || 'unknown';
   const lastSeen = presenceInfo.lastSeen || null;
-  
   const prevState = lastPresenceState.get(contactNumber);
   
   if (prevState === newState && !lastSeen) return;
-  
   lastPresenceState.set(contactNumber, newState);
   
   const stateText = newState === 'available' ? '🟢 EN LÍNEA' : 
-                    newState === 'unavailable' ? '🔴 DESCONECTADO' : 
-                    `⚪ ${newState}`;
+                    newState === 'unavailable' ? '🔴 DESCONECTADO' : `⚪ ${newState}`;
   
   console.log(`\n${'='.repeat(50)}`);
   console.log(`[!] EVENTO DETECTADO: ${contactNumber}`);
@@ -214,15 +209,10 @@ async function processPresenceEvent(id, presences) {
   if (lastSeen) console.log(`    Últ. vez: ${new Date(lastSeen * 1000).toLocaleString()}`);
   console.log(`${'='.repeat(50)}`);
   
-  // ENVIAR A N8N
   await sendToN8N('presence.update', {
-    id: contactNumber,
-    originalJid: id,
-    state: newState,
-    stateText: stateText,
+    id: contactNumber, originalJid: id, state: newState, stateText: stateText,
     lastSeen: lastSeen ? new Date(lastSeen * 1000).toISOString() : null,
-    previousState: prevState || 'unknown',
-    timestamp: Date.now()
+    previousState: prevState || 'unknown', timestamp: Date.now()
   });
 }
 
@@ -231,28 +221,17 @@ async function processPresenceEvent(id, presences) {
 // ============================================
 function startLoops() {
   if (heartbeatTimer) return;
-  
   console.log('[LOOPS] Iniciando sistema sigiloso...');
-  
   heartbeatTimer = setInterval(stealthHeartbeat, HEARTBEAT_INTERVAL_MS);
-  
   probeTimer = setInterval(async () => {
     if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
-    for (const number of subscribedNumbers) {
-      await stealthProbe(number);
-      await new Promise(r => setTimeout(r, 300));
-    }
+    for (const number of subscribedNumbers) { await stealthProbe(number); await new Promise(r => setTimeout(r, 300)); }
   }, PROBE_INTERVAL_MS);
-  
   resubTimer = setInterval(async () => {
     if (connectionState !== 'connected' || subscribedNumbers.size === 0) return;
     for (const number of subscribedNumbers) {
-      const jid = `${number}@s.whatsapp.net`;
-      const lidJid = numberToLidMap.get(number);
-      try {
-        await sock.presenceSubscribe(jid);
-        if (lidJid) await sock.presenceSubscribe(lidJid);
-      } catch (e) {}
+      const jid = `${number}@s.whatsapp.net`; const lidJid = numberToLidMap.get(number);
+      try { await sock.presenceSubscribe(jid); if (lidJid) await sock.presenceSubscribe(lidJid); } catch (e) {}
       await new Promise(r => setTimeout(r, 200));
     }
   }, RESUB_INTERVAL_MS);
@@ -274,55 +253,32 @@ async function connectToWhatsApp() {
   sock = makeWASocket({
     version, logger,
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-    printQRInTerminal: false,
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false,
+    printQRInTerminal: false, markOnlineOnConnect: false,
+    syncFullHistory: false, shouldSyncHistoryMessage: () => false,
   });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      qrString = qr;
-      connectionState = 'qr';
-      try {
-        const base64 = await QRCode.toDataURL(qr);
-        await sendToN8N('qrcode.updated', { qrcode: { base64 } });
-      } catch (e) {}
+      qrString = qr; connectionState = 'qr';
+      try { const base64 = await QRCode.toDataURL(qr); await sendToN8N('qrcode.updated', { qrcode: { base64 } }); } catch (e) {}
     }
-
     if (connection === 'open') {
-      qrString = null;
-      connectionState = 'connected';
+      qrString = null; connectionState = 'connected';
       console.log('\n========================================');
       console.log('  ✓ MODO SIGILOSO ACTIVADO');
       console.log(`  Sesión: ${sock.user?.id}`);
       console.log('========================================\n');
-      
-      // Log de configuración
       console.log(`[CONFIG] N8N URL: ${N8N_WEBHOOK_URL || 'NO CONFIGURADA'}`);
-      console.log(`[CONFIG] API KEY: ${API_KEY}`);
-      
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
-
       await new Promise(r => setTimeout(r, 1000));
       await sock.sendPresenceUpdate('unavailable');
-      
-      for (const number of subscribedNumbers) {
-        await subscribeToPresence(number);
-        await new Promise(r => setTimeout(r, 300));
-      }
-      
+      for (const number of subscribedNumbers) { await subscribeToPresence(number); await new Promise(r => setTimeout(r, 300)); }
       startLoops();
     }
-
     if (connection === 'close') {
-      connectionState = 'disconnected';
-      stopLoops();
-      const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-        ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut : true;
-      
+      connectionState = 'disconnected'; stopLoops();
+      const shouldReconnect = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut : true;
       if (shouldReconnect) setTimeout(connectToWhatsApp, 5000);
       else if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true });
     }
@@ -332,17 +288,12 @@ async function connectToWhatsApp() {
 
   sock.ev.on('presence.update', async (eventData) => {
     console.log('[RAW]', JSON.stringify(eventData));
-    
     if (eventData?.id && eventData?.presences) {
       await processPresenceEvent(eventData.id, eventData.presences);
     } else if (Array.isArray(eventData)) {
-      for (const item of eventData) {
-        if (item?.id && item?.presences) await processPresenceEvent(item.id, item.presences);
-      }
+      for (const item of eventData) { if (item?.id && item?.presences) await processPresenceEvent(item.id, item.presences); }
     } else if (eventData && typeof eventData === 'object') {
-      for (const key of Object.keys(eventData)) {
-        if (typeof eventData[key] === 'object') await processPresenceEvent(key, eventData[key]);
-      }
+      for (const key of Object.keys(eventData)) { if (typeof eventData[key] === 'object') await processPresenceEvent(key, eventData[key]); }
     }
   });
 }
@@ -358,15 +309,9 @@ function authMiddleware(req, res, next) {
 
 app.get('/qr-page', (req, res) => {
   if (connectionState === 'connected') {
-    return res.send(`<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px">
-      <h1>✓ Sigiloso Activado</h1><p>Número: ${sock?.user?.id}</p>
-      <p>Vigilando: ${subscribedNumbers.size} contactos</p>
-      <p style="color:#666;font-size:12px">No apareces en línea.</p>
-    </body></html>`);
+    return res.send(`<html><body style="background:#0B1120;color:#22D67A;font-family:sans-serif;text-align:center;padding:50px"><h1>✓ Sigiloso Activado</h1><p>Número: ${sock?.user?.id}</p><p>Vigilando: ${subscribedNumbers.size} contactos</p></body></html>`);
   }
-  res.send(`<html><head><meta charset="utf-8"><title>QR</title>
-  <meta http-equiv="refresh" content="10"><style>body{background:#0B1120;color:#E7EAF2;font-family:sans-serif;text-align:center;padding:40px}h1{color:#22D67A}img{border:8px solid white;border-radius:12px;margin:20px}</style></head>
-  <body><h1>Monitor Sigiloso</h1><p>Escanea QR</p><img src="/qr-image" width="280" height="280"><p>Estado: ${connectionState}</p></body></html>`);
+  res.send(`<html><head><meta charset="utf-8"><title>QR</title><meta http-equiv="refresh" content="10"><style>body{background:#0B1120;color:#E7EAF2;font-family:sans-serif;text-align:center;padding:40px}h1{color:#22D67A}img{border:8px solid white;border-radius:12px;margin:20px}</style></head><body><h1>Monitor Sigiloso</h1><p>Escanea QR</p><img src="/qr-image" width="280" height="280"><p>Estado: ${connectionState}</p></body></html>`);
 });
 
 app.get('/qr-image', async (req, res) => {
@@ -378,12 +323,7 @@ app.get('/qr-image', async (req, res) => {
 app.get('/health', (req, res) => res.json({ state: connectionState, active: !!heartbeatTimer, monitored: subscribedNumbers.size }));
 
 app.get('/status', authMiddleware, (req, res) => {
-  res.json({ 
-    state: connectionState, number: sock?.user?.id, 
-    subscribed: [...subscribedNumbers],
-    lids: Object.fromEntries(lidToNumberMap),
-    lastStates: Object.fromEntries(lastPresenceState)
-  });
+  res.json({ state: connectionState, number: sock?.user?.id, subscribed: [...subscribedNumbers], lids: Object.fromEntries(lidToNumberMap), lastStates: Object.fromEntries(lastPresenceState) });
 });
 
 app.post('/subscribe', authMiddleware, async (req, res) => {
@@ -404,6 +344,27 @@ app.post('/subscribe/bulk', authMiddleware, async (req, res) => {
     await new Promise(r => setTimeout(r, 500));
   }
   res.json({ results });
+});
+
+// ============================================
+// ENDPOINT SECRETO: FORZAR LID MANUALMENTE
+// ============================================
+app.post('/force-lid', authMiddleware, async (req, res) => {
+  const { number, lid } = req.body;
+  if (!number || !lid) return res.status(400).json({ error: 'number y lid requeridos' });
+  const cleanNumber = String(number).replace(/[^0-9]/g, '');
+  const lidJid = lid.includes('@') ? lid : `${lid}@lid`;
+  numberToLidMap.set(cleanNumber, lidJid);
+  lidToNumberMap.set(lidJid, cleanNumber);
+  subscribedNumbers.add(cleanNumber);
+  console.log(`[FORCE] ✓ LID inyectado: ${cleanNumber} ↔ ${lidJid}`);
+  if (sock && connectionState === 'connected') {
+    try {
+      await sock.presenceSubscribe(lidJid);
+      console.log(`[FORCE] ✓ Re-suscrito al LID: ${lidJid}`);
+    } catch (e) { console.log(`[FORCE] ✗ Error suscribiendo: ${e.message}`); }
+  }
+  res.json({ success: true, number: cleanNumber, lid: lidJid });
 });
 
 app.post('/disconnect', authMiddleware, async (req, res) => {

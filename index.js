@@ -34,6 +34,15 @@ let lidToNumberMap = new Map();
 const logger = pino({ level: 'silent' });
 
 // ============================================
+// 🧠 BASE DE DATOS LOCAL DE LIDS (FORZADO)
+// ============================================
+const KNOWN_LIDS = {
+  '12407305677': '238379996319763@lid',
+  '50375962141': '188489773613229@lid',
+  '50372107556': '192251460370522@lid' // Agregué el 6 que faltaba
+};
+
+// ============================================
 // ENVIAR A N8N
 // ============================================
 async function sendToN8N(event, data) {
@@ -106,76 +115,9 @@ function resolveJidToNumber(jid) {
         return num;
       }
     }
-    console.log(`[MAP] ⚠️ LID sin mapear: ${jid}`);
     return lidClean;
   }
   return jid.split('@')[0];
-}
-
-// ============================================
-// SUSCRIBIRSE (CON LOG ESPÍA Y LID FORZADO)
-// ============================================
-async function subscribeToPresence(number) {
-  if (!sock || connectionState !== 'connected') return false;
-  
-  try {
-    const cleanNumber = String(number).replace(/[^0-9]/g, '');
-    const jid = `${cleanNumber}@s.whatsapp.net`;
-    
-    const [info] = await sock.onWhatsApp(jid);
-    
-    // === LOG ESPÍA ===
-    console.log(`[ESPÍA] WhatsApp respondió de ${cleanNumber}:`, JSON.stringify(info));
-    // ==================
-    
-    if (!info?.exists) {
-      console.log(`[SUB] ✗ No existe: ${cleanNumber}`);
-      return false;
-    }
-    
-    let lidJid = null;
-    
-    if (info?.lid) {
-      lidJid = info.lid;
-      numberToLidMap.set(cleanNumber, lidJid);
-      lidToNumberMap.set(lidJid, cleanNumber);
-      console.log(`[MAP] ✓ ${cleanNumber} ↔ ${lidJid}`);
-    } else {
-      console.log(`[MAP] ⚠️ Sin LID para: ${cleanNumber}. Forzando...`);
-      try {
-        await sock.profilePictureUrl(jid, 'preview').catch(() => {});
-        await new Promise(r => setTimeout(r, 1000));
-        const [info2] = await sock.onWhatsApp(jid);
-        if (info2?.lid) {
-          lidJid = info2.lid;
-          numberToLidMap.set(cleanNumber, lidJid);
-          lidToNumberMap.set(lidJid, cleanNumber);
-          console.log(`[MAP] ✓ LID forzado: ${cleanNumber} ↔ ${lidJid}`);
-        } else {
-          console.log(`[MAP] ✗ No se pudo obtener LID para: ${cleanNumber}`);
-        }
-      } catch (e) {
-        console.log(`[MAP] ✗ Error forzando LID: ${e.message}`);
-      }
-    }
-    
-    await sock.presenceSubscribe(jid);
-    console.log(`[SUB] ✓ Suscrito número: ${cleanNumber}`);
-    
-    if (lidJid) {
-      await new Promise(r => setTimeout(r, 300));
-      await sock.presenceSubscribe(lidJid);
-      console.log(`[SUB] ✓ Suscrito LID: ${lidJid}`);
-    }
-    
-    subscribedNumbers.add(cleanNumber);
-    console.log(`[SUB] 👁 Vigilando a: ${cleanNumber}`);
-    return true;
-    
-  } catch (err) {
-    console.log(`[SUB] ✗ Error: ${err.message}`);
-    return false;
-  }
 }
 
 // ============================================
@@ -205,7 +147,6 @@ async function processPresenceEvent(id, presences) {
   console.log(`[!] EVENTO DETECTADO: ${contactNumber}`);
   console.log(`    Estado: ${stateText}`);
   console.log(`    Anterior: ${prevState || 'Desconocido'}`);
-  console.log(`    JID original: ${id}`);
   if (lastSeen) console.log(`    Últ. vez: ${new Date(lastSeen * 1000).toLocaleString()}`);
   console.log(`${'='.repeat(50)}`);
   
@@ -269,11 +210,37 @@ async function connectToWhatsApp() {
       console.log('  ✓ MODO SIGILOSO ACTIVADO');
       console.log(`  Sesión: ${sock.user?.id}`);
       console.log('========================================\n');
-      console.log(`[CONFIG] N8N URL: ${N8N_WEBHOOK_URL || 'NO CONFIGURADA'}`);
+      
       await sendToN8N('connection.update', { state: 'open', wuid: sock.user?.id });
       await new Promise(r => setTimeout(r, 1000));
       await sock.sendPresenceUpdate('unavailable');
-      for (const number of subscribedNumbers) { await subscribeToPresence(number); await new Promise(r => setTimeout(r, 300)); }
+      
+      // ========================================
+      // 🚀 INYECCIÓN AUTOMÁTICA DE LIDS
+      // ========================================
+      console.log('[INIT] Inyectando LIDs conocidos...');
+      for (const [number, lid] of Object.entries(KNOWN_LIDS)) {
+        numberToLidMap.set(number, lid);
+        lidToNumberMap.set(lid, number);
+        subscribedNumbers.add(number);
+        console.log(`[INIT] ✅ Mapeado: ${number} ↔ ${lid}`);
+      }
+      
+      // Suscribirse a todos los inyectados
+      for (const [number, lid] of Object.entries(KNOWN_LIDS)) {
+        const jid = `${number}@s.whatsapp.net`;
+        try {
+          await sock.presenceSubscribe(jid);
+          await new Promise(r => setTimeout(r, 200));
+          await sock.presenceSubscribe(lid);
+          console.log(`[INIT] 👁 Suscrito a: ${number}`);
+        } catch (e) {
+          console.log(`[INIT] Error suscribiendo ${number}: ${e.message}`);
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      // ========================================
+
       startLoops();
     }
     if (connection === 'close') {
@@ -326,47 +293,6 @@ app.get('/status', authMiddleware, (req, res) => {
   res.json({ state: connectionState, number: sock?.user?.id, subscribed: [...subscribedNumbers], lids: Object.fromEntries(lidToNumberMap), lastStates: Object.fromEntries(lastPresenceState) });
 });
 
-app.post('/subscribe', authMiddleware, async (req, res) => {
-  const { number } = req.body;
-  if (!number) return res.status(400).json({ error: 'number requerido' });
-  const clean = String(number).replace(/[^0-9]/g, '');
-  const success = await subscribeToPresence(clean);
-  res.json({ success, number: clean, lid: numberToLidMap.get(clean) || null });
-});
-
-app.post('/subscribe/bulk', authMiddleware, async (req, res) => {
-  const { numbers } = req.body;
-  if (!Array.isArray(numbers)) return res.status(400).json({ error: 'array requerido' });
-  const results = [];
-  for (const n of numbers) {
-    const clean = String(n).replace(/[^0-9]/g, '');
-    results.push({ number: clean, success: await subscribeToPresence(clean), lid: numberToLidMap.get(clean) || null });
-    await new Promise(r => setTimeout(r, 500));
-  }
-  res.json({ results });
-});
-
-// ============================================
-// ENDPOINT SECRETO: FORZAR LID MANUALMENTE
-// ============================================
-app.post('/force-lid', authMiddleware, async (req, res) => {
-  const { number, lid } = req.body;
-  if (!number || !lid) return res.status(400).json({ error: 'number y lid requeridos' });
-  const cleanNumber = String(number).replace(/[^0-9]/g, '');
-  const lidJid = lid.includes('@') ? lid : `${lid}@lid`;
-  numberToLidMap.set(cleanNumber, lidJid);
-  lidToNumberMap.set(lidJid, cleanNumber);
-  subscribedNumbers.add(cleanNumber);
-  console.log(`[FORCE] ✓ LID inyectado: ${cleanNumber} ↔ ${lidJid}`);
-  if (sock && connectionState === 'connected') {
-    try {
-      await sock.presenceSubscribe(lidJid);
-      console.log(`[FORCE] ✓ Re-suscrito al LID: ${lidJid}`);
-    } catch (e) { console.log(`[FORCE] ✗ Error suscribiendo: ${e.message}`); }
-  }
-  res.json({ success: true, number: cleanNumber, lid: lidJid });
-});
-
 app.post('/disconnect', authMiddleware, async (req, res) => {
   stopLoops(); await sock?.logout(); connectionState = 'disconnected';
   subscribedNumbers.clear(); numberToLidMap.clear(); lidToNumberMap.clear(); lastPresenceState.clear();
@@ -375,6 +301,5 @@ app.post('/disconnect', authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[SERVER] Modo Sigiloso en puerto ${PORT}`);
-  console.log(`[SERVER] N8N URL: ${N8N_WEBHOOK_URL || 'NO CONFIGURADA'}`);
   connectToWhatsApp();
 });

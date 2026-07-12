@@ -252,7 +252,18 @@ async function connectToWhatsApp() {
   });
 
   sock.ev.on('creds.update', saveCreds);
-
+  // ========================================
+  // 👁 MODO RADAR: Detectar si Meta ignora al bot
+  // ========================================
+  sock.ev.on('*', (eventName, data) => {
+    // Ignorar estos eventos porque son muy ruidosos
+    if (['connection.update', 'creds.update', 'presence.update'].includes(eventName)) return;
+    
+    // Si llega CUALQUIER otra cosa, la imprimimos
+    const dataStr = JSON.stringify(data)?.substring(0, 150);
+    console.log(`[RADAR] Evento recibido: ${eventName} -> ${dataStr}`);
+  });
+  // ========================================
   sock.ev.on('presence.update', async (eventData) => {
     console.log('[RAW]', JSON.stringify(eventData));
     if (eventData?.id && eventData?.presences) {
